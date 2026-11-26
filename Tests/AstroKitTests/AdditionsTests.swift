@@ -4,9 +4,9 @@ import Testing
 
 // Tests for the API AstroKit adds on top of Equinox's calculators, ported from
 // Lunker's (SolarCalculatorTests, MoonCalculatorTests, SolunarCalculatorTests)
-// and Otta's (SolarCalculatorTests, LunarCalculatorTests) suites. Assertions on
-// behaviour where the apps' implementations differ numerically were adapted to
-// AstroKit's (= Equinox's) numbers; see README "Numeric discrepancies".
+// and Otta's (SolarCalculatorTests, LunarCalculatorTests) suites. Since 0.2 the
+// numbers are Lunker's; the full Lunker port is in LunkerPortTests.swift. See
+// README "0.2 behaviour vs 0.1".
 
 private let stockholm = (lat: 59.3293, lon: 18.0686)
 private let stockholmTZ = TimeZone(identifier: "Europe/Stockholm")!

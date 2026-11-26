@@ -124,6 +124,16 @@ final class TwilightTests: XCTestCase {
         )
 
         XCTAssertNil(twilight, "Should return nil during midnight sun")
+
+        // 0.2: the all-optional variant agrees here, because at 78°N on the
+        // solstice the sun stays above +11° and crosses no boundary at all.
+        // (In polar *night* it differs: see LunkerPortTests.)
+        XCTAssertNil(SolarCalculator.twilightBoundaries(
+            date: date,
+            latitude: TestLocations.svalbard.lat,
+            longitude: TestLocations.svalbard.lon,
+            timeZone: tz
+        ))
     }
 
     // MARK: - Equator Tests

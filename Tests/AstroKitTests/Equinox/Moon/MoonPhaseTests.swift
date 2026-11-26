@@ -9,25 +9,25 @@ final class MoonPhaseTests: XCTestCase {
 
     func test_moonPhase_knownFullMoonJan2025_returnsNearFullMoon() {
         // January 13, 2025 ~22:27 UTC is a full moon
-        // Phase classification may be fullMoon or adjacent phases due to age calculation
+        // Re-baselined for 0.2: the phase name comes from the sun–moon
+        // elongation (not a linear mean-lunation age), with bins centred on
+        // each event, so the instant of full moon is exactly Full Moon.
+        // (0.1 accepted the gibbous neighbours.)
         let date = ReferenceMoonPhases.fullMoonJan2025
         let phaseInfo = MoonCalculator.moonPhase(for: date)
 
-        let nearFullPhases: [MoonCalculator.MoonPhase] = [.waxingGibbous, .fullMoon, .waningGibbous]
-        XCTAssertTrue(nearFullPhases.contains(phaseInfo.phase),
-                      "Expected near-full phase, got \(phaseInfo.phase)")
+        XCTAssertEqual(phaseInfo.phase, .fullMoon)
         // Illumination should be high
         XCTAssertGreaterThan(phaseInfo.illumination, 0.95)
     }
 
     func test_moonPhase_knownFullMoonFeb2025_returnsNearFullMoon() {
         // February 12, 2025 is a full moon
+        // Re-baselined for 0.2 (see above): exactly Full Moon.
         let date = ReferenceMoonPhases.fullMoonFeb2025
         let phaseInfo = MoonCalculator.moonPhase(for: date)
 
-        let nearFullPhases: [MoonCalculator.MoonPhase] = [.waxingGibbous, .fullMoon, .waningGibbous]
-        XCTAssertTrue(nearFullPhases.contains(phaseInfo.phase),
-                      "Expected near-full phase, got \(phaseInfo.phase)")
+        XCTAssertEqual(phaseInfo.phase, .fullMoon)
         // Illumination should be high
         XCTAssertGreaterThan(phaseInfo.illumination, 0.95)
     }
@@ -89,6 +89,12 @@ final class MoonPhaseTests: XCTestCase {
         let isNearZero = phaseInfo.age < 2
         let isNearEnd = phaseInfo.age > 27.5
         XCTAssertTrue(isNearZero || isNearEnd, "Age should be near cycle boundary")
+
+        // Re-baselined for 0.2: age = elongation / 360° × synodic month, so at
+        // the new-moon instant it is within half a day of the wrap (29.34 d,
+        // the model's elongation is ≈ −2.4°). 0.1's mean-lunation age gave 0.28 d.
+        let distanceToWrap = min(phaseInfo.age, phaseInfo.synodicMonth - phaseInfo.age)
+        XCTAssertLessThan(distanceToWrap, 0.5)
     }
 
     func test_moonPhase_fullMoon_ageNear15Days() {
@@ -96,8 +102,11 @@ final class MoonPhaseTests: XCTestCase {
         let phaseInfo = MoonCalculator.moonPhase(for: date)
 
         // Full moon is approximately halfway through the cycle
+        // Re-baselined for 0.2: age comes from the elongation, so at the
+        // full-moon instant it is 14.96 d (half cycle 14.77 d). 0.1's linear
+        // mean-lunation age gave 14.22 d, hence the old ±2 d tolerance.
         let halfCycle = phaseInfo.synodicMonth / 2
-        XCTAssertEqual(phaseInfo.age, halfCycle, accuracy: 2)
+        XCTAssertEqual(phaseInfo.age, halfCycle, accuracy: 0.5)
     }
 
     // MARK: - Synodic Month Tests

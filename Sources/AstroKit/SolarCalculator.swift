@@ -3,10 +3,12 @@ import Foundation
 /// Calculates solar events (equinoxes, solstices) and sunrise/sunset times.
 /// Based on the NOAA solar calculator and Jean Meeus "Astronomical Algorithms".
 ///
-/// Ported from Equinox (`Shared/SolarCalculator.swift`), the reference
-/// implementation. Additions for Lunker (`polarState`, `PolarState`) and Otta
-/// (`eventTimeClampingPolar`) are layered on the same math, so every app gets
-/// identical numbers.
+/// API ported from Equinox (`Shared/SolarCalculator.swift`), with additions for
+/// Lunker (`polarState`, `twilightBoundaries`) and Otta
+/// (`eventTimeClampingPolar`). Since 0.2 the numbers follow Lunker's
+/// implementation: per-day results are anchored to the location's calendar
+/// day with declination/equation of time taken at solar noon, and
+/// position/elevation/subsolar queries evaluate them at the exact instant.
 ///
 /// All members are static and pure; the only state is a lock-guarded cache of
 /// equinox/solstice dates per year.
@@ -157,7 +159,21 @@ public struct SolarCalculator: Sendable {
 
     // Astronomical date arithmetic must be Gregorian: locales like ar-SA default
     // to a lunar calendar whose year/month components would corrupt the algorithms.
-    private static let calendar = Calendar(identifier: .gregorian)
+    private static let utcTimeZone = TimeZone(identifier: "UTC") ?? TimeZone(secondsFromGMT: 0)!
+    /// Gregorian calendar pinned to UTC, so results never depend on the device
+    /// calendar or time zone.
+    private static let gregorianUTC: Calendar = {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = utcTimeZone
+        return cal
+    }()
+    /// A Gregorian calendar in `timeZone`. Per-day results are anchored to the
+    /// *location's* calendar day.
+    private static func calendar(in timeZone: TimeZone) -> Calendar {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = timeZone
+        return cal
+    }
     private static let rad = Double.pi / 180
     private static let deg = 180 / Double.pi
 
@@ -208,7 +224,7 @@ public struct SolarCalculator: Sendable {
 
     /// Find the last solar event before a given date
     public static func lastEvent(before date: Date, ofType types: [SolarEventType]? = nil) -> SolarEvent {
-        let year = calendar.component(.year, from: date)
+        let year = gregorianUTC.component(.year, from: date)
         let targetTypes = types ?? SolarEventType.allCases
 
         // Check current year and previous year
@@ -225,7 +241,7 @@ public struct SolarCalculator: Sendable {
 
     /// Find the next solar event after a given date
     public static func nextEvent(after date: Date, ofType types: [SolarEventType]? = nil) -> SolarEvent {
-        let year = calendar.component(.year, from: date)
+        let year = gregorianUTC.component(.year, from: date)
         let targetTypes = types ?? SolarEventType.allCases
 
         // Check current year and next year
@@ -267,6 +283,55 @@ public struct SolarCalculator: Sendable {
         return next.addingTimeInterval(next.timeIntervalSince(date))
     }
 
+    // MARK: - Day Anchoring (from Lunker)
+
+    /// One local calendar day at a location, anchored for NOAA event math.
+    private struct DayAnchor {
+        /// 00:00 UTC of the Gregorian date whose UTC-minute event times land
+        /// on the location's local calendar day.
+        let midnightUTC: Date
+        /// Declination / equation of time evaluated at that day's solar noon.
+        let elements: SolarElements
+    }
+
+    /// Anchor the location's local calendar day containing `date`.
+    ///
+    /// NOAA gives event times as *UTC* minutes after 00:00 UTC of a date
+    /// (`720 − 4·lon − eqTime ± 4·ha`). Adding those to UTC midnight is exact
+    /// on every day, including 23 h/25 h DST-transition days. The zone only
+    /// picks *which* date (a whole-day shift for zones far from their
+    /// meridian, e.g. UTC+14 at −157°), so the result does not depend on the
+    /// time of day passed in, nor on the device time zone. Declination and the
+    /// equation of time are evaluated at that day's solar noon.
+    private static func dayAnchor(for date: Date, longitude: Double, timeZone: TimeZone) -> DayAnchor {
+        let comps = calendar(in: timeZone).dateComponents([.year, .month, .day], from: date)
+        let jd0 = julianDay(year: comps.year ?? 2000, month: comps.month ?? 1, day: comps.day ?? 1)
+        // Local wall-clock minute of solar noon if anchored on this UTC date;
+        // shift whole days until it falls within the local date.
+        let noonUTCMinutes = 720 - 4 * longitude
+        let offsetMinutes = Double(timeZone.secondsFromGMT(for: date)) / 60.0
+        let dayShift = -(((noonUTCMinutes + offsetMinutes) / 1440).rounded(.down))
+        let jd = jd0 + dayShift
+        return DayAnchor(
+            midnightUTC: Date(timeIntervalSince1970: (jd - 2_440_587.5) * 86_400),
+            elements: solarElements(julianDay: jd + (720 - 4 * longitude) / 1440)
+        )
+    }
+
+    /// Cosine of the hour angle at which the sun's centre reaches `zenith`.
+    /// Outside [−1, 1] it never does: > 1 stays below, < −1 stays above.
+    private static func cosHourAngle(zenith: Double, latitude: Double, declination: Double) -> Double {
+        let latRad = latitude * rad
+        let decRad = declination * rad
+        return (cos(zenith * rad) / (cos(latRad) * cos(decRad))) - tan(latRad) * tan(decRad)
+    }
+
+    /// Event instant for hour angle `ha` (degrees; negative = morning).
+    private static func instant(_ anchor: DayAnchor, longitude: Double, hourAngle ha: Double) -> Date {
+        let utcMinutes = 720 - 4 * longitude - anchor.elements.eqTime + 4 * ha
+        return anchor.midnightUTC.addingTimeInterval(utcMinutes * 60)
+    }
+
     // MARK: - Sunrise/Sunset Calculations (NOAA Algorithm)
 
     /// Why `sunTimes` returned nil: the sun never sets (midnight sun) or never
@@ -284,14 +349,14 @@ public struct SolarCalculator: Sendable {
         case polarNight
     }
 
-    /// Non-nil when the location has no sunrise/sunset on this date.
+    /// Non-nil when the location has no sunrise/sunset on this date. Same
+    /// answer as `polarState` (Equinox naming).
     public static func polarCondition(date: Date, latitude: Double, longitude: Double, timeZone: TimeZone = .current) -> PolarCondition? {
-        guard sunTimes(date: date, latitude: latitude, longitude: longitude, timeZone: timeZone) == nil else { return nil }
-        let cal = calendar
-        var noonComponents = cal.dateComponents(in: timeZone, from: date)
-        noonComponents.hour = 12; noonComponents.minute = 0; noonComponents.second = 0
-        let noon = cal.date(from: noonComponents) ?? date
-        return solarElevation(at: noon, latitude: latitude, longitude: longitude) > 0 ? .midnightSun : .polarNight
+        switch polarState(date: date, latitude: latitude, longitude: longitude, timeZone: timeZone) {
+        case .polarDay: return .midnightSun
+        case .polarNight: return .polarNight
+        case nil: return nil
+        }
     }
 
     /// Whether the sun stays up (`.polarDay`) or down (`.polarNight`) all day,
@@ -299,126 +364,142 @@ public struct SolarCalculator: Sendable {
     /// same declination as `sunTimes`, so it is non-nil exactly when `sunTimes`
     /// is nil. Returns nil when the sun rises and sets normally that day.
     public static func polarState(date: Date, latitude: Double, longitude: Double, timeZone: TimeZone = .current) -> PolarState? {
-        let cosHA = cosHourAngle(date: date, latitude: latitude, zenith: 90.833)
+        let anchor = dayAnchor(for: date, longitude: longitude, timeZone: timeZone)
+        let cosHA = cosHourAngle(zenith: 90.833, latitude: latitude, declination: anchor.elements.declin)
         if cosHA < -1 { return .polarDay }
         if cosHA > 1 { return .polarNight }
         return nil
     }
 
-    /// Calculate sunrise and sunset times for a given date and location
+    /// Sunrise, sunset and solar noon on the local calendar day (in
+    /// `timeZone`) containing `date`. Any time of day within that day gives
+    /// the same result. Returns nil during polar day or polar night.
     public static func sunTimes(date: Date, latitude: Double, longitude: Double, timeZone: TimeZone = .current) -> SunTimes? {
-        let cal = calendar
-        let year = cal.component(.year, from: date)
-        let month = cal.component(.month, from: date)
-        let day = cal.component(.day, from: date)
-
-        // Julian day
-        let jd = julianDay(year: year, month: month, day: day)
-
-        let t = (jd - 2451545.0) / 36525.0
-        let elements = solarElements(t: t)
-        let declin = elements.declin
-        let eqTime = elements.eqTime
-
-        // Hour angle for sunrise/sunset
-        let latRad = latitude * rad
-        let decRad = declin * rad
-        let zenith = 90.833 // Official zenith for sunrise/sunset
-
-        let cosHA = (cos(zenith * rad) / (cos(latRad) * cos(decRad))) - tan(latRad) * tan(decRad)
-
-        // Check for polar day/night
-        if cosHA > 1 || cosHA < -1 {
-            return nil // No sunrise/sunset (polar)
-        }
-
-        let ha = acos(cosHA) * deg
-
-        // Timezone offset in minutes
-        let tzOffsetMinutes = Double(timeZone.secondsFromGMT(for: date)) / 60.0
-
-        // Solar noon in local time (minutes from midnight)
-        let solarNoonMinutes = 720 - 4 * longitude - eqTime + tzOffsetMinutes
-
-        // Sunrise and sunset times (minutes from local midnight)
-        let sunriseMinutes = solarNoonMinutes - ha * 4
-        let sunsetMinutes = solarNoonMinutes + ha * 4
-
-        let sunrise = instant(minutesAfterLocalMidnight: sunriseMinutes, tzOffsetMinutes: tzOffsetMinutes, on: date, timeZone: timeZone)
-        let sunset = instant(minutesAfterLocalMidnight: sunsetMinutes, tzOffsetMinutes: tzOffsetMinutes, on: date, timeZone: timeZone)
-        let solarNoon = instant(minutesAfterLocalMidnight: solarNoonMinutes, tzOffsetMinutes: tzOffsetMinutes, on: date, timeZone: timeZone)
-
-        return SunTimes(sunrise: sunrise, sunset: sunset, solarNoon: solarNoon)
+        sunTimes(anchor: dayAnchor(for: date, longitude: longitude, timeZone: timeZone), latitude: latitude, longitude: longitude)
     }
 
-    /// Converts a NOAA local clock time (minutes after local midnight, at
-    /// `tzOffsetMinutes`) to an absolute instant. Going through UTC rather than
-    /// adding elapsed seconds to local midnight keeps the result right on DST
-    /// change days, when midnight and the event sit on different UTC offsets.
-    private static func instant(minutesAfterLocalMidnight minutes: Double, tzOffsetMinutes: Double, on date: Date, timeZone: TimeZone) -> Date {
-        var localCal = calendar
-        localCal.timeZone = timeZone
-        var utcCal = calendar
-        utcCal.timeZone = TimeZone(identifier: "UTC")!
-        let day = localCal.dateComponents([.year, .month, .day], from: date)
-        let utcMidnight = utcCal.date(from: day) ?? localCal.startOfDay(for: date)
-        return utcMidnight.addingTimeInterval((minutes - tzOffsetMinutes) * 60)
+    private static func sunTimes(anchor: DayAnchor, latitude: Double, longitude: Double) -> SunTimes? {
+        let cosHA = cosHourAngle(zenith: 90.833, latitude: latitude, declination: anchor.elements.declin)
+        if cosHA > 1 || cosHA < -1 { return nil }
+        let ha = acos(cosHA) * deg
+        return SunTimes(
+            sunrise: instant(anchor, longitude: longitude, hourAngle: -ha),
+            sunset: instant(anchor, longitude: longitude, hourAngle: ha),
+            solarNoon: instant(anchor, longitude: longitude, hourAngle: 0)
+        )
     }
 
     // MARK: - Twilight Calculations
 
-    /// Calculate all twilight times for a given date and location
+    /// Twilight boundaries for one local day with every field optional
+    /// (Lunker's shape). During polar night `sunrise`/`sunset` are nil yet
+    /// civil or nautical twilight may still occur; during polar day the sun
+    /// may never sink low enough for some (or any) boundaries.
+    public struct TwilightBoundaries: Sendable, Hashable {
+        public let astronomicalDawn: Date?
+        public let nauticalDawn: Date?
+        public let civilDawn: Date?
+        public let sunrise: Date?
+        public let sunset: Date?
+        public let civilDusk: Date?
+        public let nauticalDusk: Date?
+        public let astronomicalDusk: Date?
+
+        public init(astronomicalDawn: Date?, nauticalDawn: Date?, civilDawn: Date?, sunrise: Date?, sunset: Date?,
+                    civilDusk: Date?, nauticalDusk: Date?, astronomicalDusk: Date?) {
+            self.astronomicalDawn = astronomicalDawn
+            self.nauticalDawn = nauticalDawn
+            self.civilDawn = civilDawn
+            self.sunrise = sunrise
+            self.sunset = sunset
+            self.civilDusk = civilDusk
+            self.nauticalDusk = nauticalDusk
+            self.astronomicalDusk = astronomicalDusk
+        }
+    }
+
+    /// Calculate all twilight times for a given date and location.
     /// Twilight zenith angles:
     /// - Civil: 96° (sun 6° below horizon)
     /// - Nautical: 102° (sun 12° below horizon)
     /// - Astronomical: 108° (sun 18° below horizon)
+    ///
+    /// Returns nil when the sun does not rise that day, because
+    /// `TwilightTimes.sunrise` is non-optional. Use `twilightBoundaries` to
+    /// also get twilight during polar night.
     public static func twilightTimes(date: Date, latitude: Double, longitude: Double, timeZone: TimeZone = .current) -> TwilightTimes? {
-        guard let sunTimes = sunTimes(date: date, latitude: latitude, longitude: longitude, timeZone: timeZone) else {
+        let anchor = dayAnchor(for: date, longitude: longitude, timeZone: timeZone)
+        guard let sunTimes = sunTimes(anchor: anchor, latitude: latitude, longitude: longitude) else {
             return nil
         }
-
-        let civilDawn = sunTimeForZenith(date: date, latitude: latitude, longitude: longitude, zenith: 96, isSunrise: true, timeZone: timeZone)
-        let civilDusk = sunTimeForZenith(date: date, latitude: latitude, longitude: longitude, zenith: 96, isSunrise: false, timeZone: timeZone)
-
-        let nauticalDawn = sunTimeForZenith(date: date, latitude: latitude, longitude: longitude, zenith: 102, isSunrise: true, timeZone: timeZone)
-        let nauticalDusk = sunTimeForZenith(date: date, latitude: latitude, longitude: longitude, zenith: 102, isSunrise: false, timeZone: timeZone)
-
-        let astronomicalDawn = sunTimeForZenith(date: date, latitude: latitude, longitude: longitude, zenith: 108, isSunrise: true, timeZone: timeZone)
-        let astronomicalDusk = sunTimeForZenith(date: date, latitude: latitude, longitude: longitude, zenith: 108, isSunrise: false, timeZone: timeZone)
-
+        func time(_ zenith: Double, _ isSunrise: Bool) -> Date? {
+            sunTimeForZenith(anchor: anchor, latitude: latitude, longitude: longitude, zenith: zenith, isSunrise: isSunrise)
+        }
         return TwilightTimes(
-            astronomicalDawn: astronomicalDawn,
-            nauticalDawn: nauticalDawn,
-            civilDawn: civilDawn,
+            astronomicalDawn: time(108, true),
+            nauticalDawn: time(102, true),
+            civilDawn: time(96, true),
             sunrise: sunTimes.sunrise,
             sunset: sunTimes.sunset,
-            civilDusk: civilDusk,
-            nauticalDusk: nauticalDusk,
-            astronomicalDusk: astronomicalDusk
+            civilDusk: time(96, false),
+            nauticalDusk: time(102, false),
+            astronomicalDusk: time(108, false)
         )
     }
 
-    /// Calculate golden hour and blue hour boundaries for a given date and location.
-    /// Returns nil if the location experiences no sunrise/sunset on that date.
-    public static func goldenHourTimes(date: Date, latitude: Double, longitude: Double, timeZone: TimeZone = .current) -> GoldenHourTimes? {
-        guard sunTimes(date: date, latitude: latitude, longitude: longitude, timeZone: timeZone) != nil else {
-            return nil
+    /// Twilight boundaries for a given date and location, reported
+    /// individually (Lunker's `twilightTimes`). Twilight is still reported
+    /// during polar night, when `sunrise`/`sunset` are nil. Returns nil only
+    /// when no boundary at all is crossed that day.
+    public static func twilightBoundaries(date: Date, latitude: Double, longitude: Double, timeZone: TimeZone = .current) -> TwilightBoundaries? {
+        let anchor = dayAnchor(for: date, longitude: longitude, timeZone: timeZone)
+        func time(_ zenith: Double, _ isSunrise: Bool) -> Date? {
+            sunTimeForZenith(anchor: anchor, latitude: latitude, longitude: longitude, zenith: zenith, isSunrise: isSunrise)
         }
-        return GoldenHourTimes(
-            morningBlueStart: sunTimeForZenith(date: date, latitude: latitude, longitude: longitude, zenith: 96, isSunrise: true, timeZone: timeZone),
-            morningBlueEnd: sunTimeForZenith(date: date, latitude: latitude, longitude: longitude, zenith: 94, isSunrise: true, timeZone: timeZone),
-            morningGoldenEnd: sunTimeForZenith(date: date, latitude: latitude, longitude: longitude, zenith: 84, isSunrise: true, timeZone: timeZone),
-            eveningGoldenStart: sunTimeForZenith(date: date, latitude: latitude, longitude: longitude, zenith: 84, isSunrise: false, timeZone: timeZone),
-            eveningGoldenEnd: sunTimeForZenith(date: date, latitude: latitude, longitude: longitude, zenith: 94, isSunrise: false, timeZone: timeZone),
-            eveningBlueEnd: sunTimeForZenith(date: date, latitude: latitude, longitude: longitude, zenith: 96, isSunrise: false, timeZone: timeZone)
+        let st = sunTimes(anchor: anchor, latitude: latitude, longitude: longitude)
+        let result = TwilightBoundaries(
+            astronomicalDawn: time(108, true),
+            nauticalDawn: time(102, true),
+            civilDawn: time(96, true),
+            sunrise: st?.sunrise,
+            sunset: st?.sunset,
+            civilDusk: time(96, false),
+            nauticalDusk: time(102, false),
+            astronomicalDusk: time(108, false)
         )
+        let all: [Date?] = [result.astronomicalDawn, result.nauticalDawn, result.civilDawn, result.sunrise,
+                            result.sunset, result.civilDusk, result.nauticalDusk, result.astronomicalDusk]
+        return all.contains { $0 != nil } ? result : nil
+    }
+
+    /// Calculate golden hour and blue hour boundaries for a given date and location.
+    /// Boundaries are reported individually, so blue hour still appears on
+    /// polar-night days with civil twilight. Returns nil only when the sun
+    /// crosses none of the boundaries that day.
+    public static func goldenHourTimes(date: Date, latitude: Double, longitude: Double, timeZone: TimeZone = .current) -> GoldenHourTimes? {
+        let anchor = dayAnchor(for: date, longitude: longitude, timeZone: timeZone)
+        func time(_ zenith: Double, _ isSunrise: Bool) -> Date? {
+            sunTimeForZenith(anchor: anchor, latitude: latitude, longitude: longitude, zenith: zenith, isSunrise: isSunrise)
+        }
+        let result = GoldenHourTimes(
+            morningBlueStart: time(96, true),
+            morningBlueEnd: time(94, true),
+            morningGoldenEnd: time(84, true),
+            eveningGoldenStart: time(84, false),
+            eveningGoldenEnd: time(94, false),
+            eveningBlueEnd: time(96, false)
+        )
+        let all: [Date?] = [result.morningBlueStart, result.morningBlueEnd, result.morningGoldenEnd,
+                            result.eveningGoldenStart, result.eveningGoldenEnd, result.eveningBlueEnd]
+        return all.contains { $0 != nil } ? result : nil
     }
 
     /// Time at which the sun's centre crosses `zenith` on `date`, or nil when
     /// it never does that day (polar). 90.833 = sunrise/sunset, 96/102/108 =
     /// civil/nautical/astronomical twilight, 94/84 = blue/golden hour edges.
     public static func eventTime(date: Date, latitude: Double, longitude: Double, zenith: Double, isSunrise: Bool, timeZone: TimeZone = .current) -> Date? {
-        sunTimeForZenith(date: date, latitude: latitude, longitude: longitude, zenith: zenith, isSunrise: isSunrise, timeZone: timeZone)
+        sunTimeForZenith(anchor: dayAnchor(for: date, longitude: longitude, timeZone: timeZone),
+                         latitude: latitude, longitude: longitude, zenith: zenith, isSunrise: isSunrise)
     }
 
     /// Polar-aware time at which the sun crosses `zenith` on `date`. Never nil.
@@ -435,102 +516,43 @@ public struct SolarCalculator: Sendable {
     ///   therefore shrinks to solar noon ± 1 h instead of disappearing.
     public static func eventTimeClampingPolar(date: Date, latitude: Double, longitude: Double, zenith: Double, isSunrise: Bool, timeZone: TimeZone = .current) -> Date {
         // Force-unwrap is safe: with clampPolar the helper never returns nil.
-        sunTimeForZenith(date: date, latitude: latitude, longitude: longitude, zenith: zenith,
-                         isSunrise: isSunrise, timeZone: timeZone, clampPolar: true)!
+        sunTimeForZenith(anchor: dayAnchor(for: date, longitude: longitude, timeZone: timeZone),
+                         latitude: latitude, longitude: longitude, zenith: zenith,
+                         isSunrise: isSunrise, clampPolar: true)!
     }
 
-    /// Calculate sun time for a specific zenith angle
-    private static func sunTimeForZenith(date: Date, latitude: Double, longitude: Double, zenith: Double, isSunrise: Bool, timeZone: TimeZone, clampPolar: Bool = false) -> Date? {
-        let cal = calendar
-        let year = cal.component(.year, from: date)
-        let month = cal.component(.month, from: date)
-        let day = cal.component(.day, from: date)
-
-        let jd = julianDay(year: year, month: month, day: day)
-        let t = (jd - 2451545.0) / 36525.0
-        let elements = solarElements(t: t)
-        let declin = elements.declin
-        let eqTime = elements.eqTime
-
-        let latRad = latitude * rad
-        let decRad = declin * rad
-
-        var cosHA = (cos(zenith * rad) / (cos(latRad) * cos(decRad))) - tan(latRad) * tan(decRad)
-
+    /// Sun time for a specific zenith angle on an anchored day.
+    private static func sunTimeForZenith(anchor: DayAnchor, latitude: Double, longitude: Double, zenith: Double, isSunrise: Bool, clampPolar: Bool = false) -> Date? {
+        var cosHA = cosHourAngle(zenith: zenith, latitude: latitude, declination: anchor.elements.declin)
         if cosHA > 1 || cosHA < -1 {
             guard clampPolar else { return nil }
             // cosHA < -1: sun always above zenith → ha = 180° (±12 h from noon).
             // cosHA > 1: sun always below zenith → ha = 0° (event at solar noon).
             cosHA = min(1, max(-1, cosHA))
         }
-
         let ha = acos(cosHA) * deg
-        let tzOffsetMinutes = Double(timeZone.secondsFromGMT(for: date)) / 60.0
-        let solarNoonMinutes = 720 - 4 * longitude - eqTime + tzOffsetMinutes
-
-        let eventMinutes = isSunrise ? solarNoonMinutes - ha * 4 : solarNoonMinutes + ha * 4
-
-        return instant(minutesAfterLocalMidnight: eventMinutes, tzOffsetMinutes: tzOffsetMinutes, on: date, timeZone: timeZone)
-    }
-
-    /// Cosine of the hour angle at which the sun reaches `zenith` on the day
-    /// `sunTimes` would use. Outside [−1, 1] it never does: > 1 stays below,
-    /// < −1 stays above.
-    private static func cosHourAngle(date: Date, latitude: Double, zenith: Double) -> Double {
-        let cal = calendar
-        let jd = julianDay(year: cal.component(.year, from: date),
-                           month: cal.component(.month, from: date),
-                           day: cal.component(.day, from: date))
-        let declin = solarElements(t: (jd - 2451545.0) / 36525.0).declin
-        let latRad = latitude * rad
-        let decRad = declin * rad
-        return (cos(zenith * rad) / (cos(latRad) * cos(decRad))) - tan(latRad) * tan(decRad)
+        return instant(anchor, longitude: longitude, hourAngle: isSunrise ? -ha : ha)
     }
 
     // MARK: - Solar Elevation and UV Index
 
     /// Calculate the sun's elevation angle at a specific time
-    /// Returns elevation in degrees (positive = above horizon, negative = below)
+    /// Returns elevation in degrees (positive = above horizon, negative = below).
+    /// Declination and equation of time are evaluated at the instant itself.
     public static func solarElevation(at time: Date, latitude: Double, longitude: Double) -> Double {
-        let cal = calendar
-        let year = cal.component(.year, from: time)
-        let month = cal.component(.month, from: time)
-        let day = cal.component(.day, from: time)
-
-        let jd = julianDay(year: year, month: month, day: day)
-        let t = (jd - 2451545.0) / 36525.0
-        let elements = solarElements(t: t)
-        let declin = elements.declin
-        let eqTime = elements.eqTime
-
-        // Time of day in minutes from midnight UTC
-        let utc = TimeZone.gmt
-        let components = cal.dateComponents(in: utc, from: time)
-        let minutesFromMidnightUTC = Double(components.hour ?? 0) * 60 + Double(components.minute ?? 0) + Double(components.second ?? 0) / 60.0
-
-        // Solar time
-        let trueSolarTime = (minutesFromMidnightUTC + eqTime + 4 * longitude).truncatingRemainder(dividingBy: 1440)
-
-        // Hour angle
-        let hourAngle: Double
-        if trueSolarTime / 4 < 0 {
-            hourAngle = trueSolarTime / 4 + 180
-        } else {
-            hourAngle = trueSolarTime / 4 - 180
-        }
-
-        // Solar zenith angle
+        let elements = solarElements(at: time)
+        let components = gregorianUTC.dateComponents([.hour, .minute, .second], from: time)
+        let minutesFromMidnightUTC = Double(components.hour ?? 0) * 60 +
+                                    Double(components.minute ?? 0) +
+                                    Double(components.second ?? 0) / 60.0
+        let trueSolarTime = (minutesFromMidnightUTC + elements.eqTime + 4 * longitude).truncatingRemainder(dividingBy: 1440)
+        let hourAngle = trueSolarTime / 4 < 0 ? trueSolarTime / 4 + 180 : trueSolarTime / 4 - 180
         let latRad = latitude * rad
-        let decRad = declin * rad
+        let decRad = elements.declin * rad
         let haRad = hourAngle * rad
-
         let cosZenith = sin(latRad) * sin(decRad) + cos(latRad) * cos(decRad) * cos(haRad)
-        // Clamp to acos's valid domain; floating-point error can push cosZenith just past ±1
-        // (at extreme elevations/latitudes), which would otherwise yield NaN. Matches solarPosition.
-        let zenithAngle = acos(min(1, max(-1, cosZenith))) * deg
-
-        // Elevation = 90 - zenith
-        return 90 - zenithAngle
+        // Clamp to acos's valid domain; floating-point error can push cosZenith just past ±1.
+        return 90 - acos(min(1.0, max(-1.0, cosZenith))) * deg
     }
 
     /// Sun position at an instant: where in the sky the sun appears.
@@ -550,39 +572,18 @@ public struct SolarCalculator: Sendable {
     /// Calculate sun azimuth + elevation at a specific time and location.
     /// Used by AR sun-path rendering and any feature that needs sun direction, not just height.
     public static func solarPosition(at time: Date, latitude: Double, longitude: Double) -> SunPosition {
-        let cal = calendar
-        let year = cal.component(.year, from: time)
-        let month = cal.component(.month, from: time)
-        let day = cal.component(.day, from: time)
-
-        let jd = julianDay(year: year, month: month, day: day)
-        let t = (jd - 2451545.0) / 36525.0
-        let elements = solarElements(t: t)
-        let declin = elements.declin
-        let eqTime = elements.eqTime
-
-        let utc = TimeZone.gmt
-        let components = cal.dateComponents(in: utc, from: time)
+        let elements = solarElements(at: time)
+        let components = gregorianUTC.dateComponents([.hour, .minute, .second], from: time)
         let minutesFromMidnightUTC = Double(components.hour ?? 0) * 60 +
                                      Double(components.minute ?? 0) +
                                      Double(components.second ?? 0) / 60.0
-
-        let trueSolarTime = (minutesFromMidnightUTC + eqTime + 4 * longitude).truncatingRemainder(dividingBy: 1440)
-
-        let hourAngle: Double
-        if trueSolarTime / 4 < 0 {
-            hourAngle = trueSolarTime / 4 + 180
-        } else {
-            hourAngle = trueSolarTime / 4 - 180
-        }
-
+        let trueSolarTime = (minutesFromMidnightUTC + elements.eqTime + 4 * longitude).truncatingRemainder(dividingBy: 1440)
+        let hourAngle = trueSolarTime / 4 < 0 ? trueSolarTime / 4 + 180 : trueSolarTime / 4 - 180
         let latRad = latitude * rad
-        let decRad = declin * rad
+        let decRad = elements.declin * rad
         let haRad = hourAngle * rad
-
         let cosZenith = sin(latRad) * sin(decRad) + cos(latRad) * cos(decRad) * cos(haRad)
-        let zenithAngle = acos(min(1, max(-1, cosZenith))) * deg
-        let elevation = 90 - zenithAngle
+        let elevation = 90 - acos(min(1, max(-1, cosZenith))) * deg
 
         // Azimuth from NOAA solar calculator convention (clockwise from north)
         let elevRad = elevation * rad
@@ -606,13 +607,16 @@ public struct SolarCalculator: Sendable {
     }
 
     /// Sample the sun's path across a full local day at fixed intervals.
-    /// Used to draw the arc in AR or 2D sky diagrams.
+    /// Used to draw the arc in AR or 2D sky diagrams. Spans local midnight to
+    /// the next local midnight, so 23 h/25 h DST-transition days are covered
+    /// exactly (the final sample may fall short of the next midnight).
     public static func sunPath(date: Date, latitude: Double, longitude: Double, intervalMinutes: Int = 10, timeZone: TimeZone = .current) -> [SunPosition] {
-        var localCal = calendar
-        localCal.timeZone = timeZone
-        let startOfDay = localCal.startOfDay(for: date)
+        let cal = calendar(in: timeZone)
+        let startOfDay = cal.startOfDay(for: date)
+        let endOfDay = cal.date(byAdding: .day, value: 1, to: startOfDay) ?? startOfDay.addingTimeInterval(86_400)
         let stride = max(1, intervalMinutes)
-        let stepCount = (24 * 60) / stride
+        let dayMinutes = Int((endOfDay.timeIntervalSince(startOfDay) / 60).rounded())
+        let stepCount = dayMinutes / stride
 
         return (0...stepCount).map { i in
             let time = startOfDay.addingTimeInterval(TimeInterval(i * stride * 60))
@@ -663,25 +667,25 @@ public struct SolarCalculator: Sendable {
         }
     }
 
+    /// Declination and equation of time are evaluated at the instant itself.
+    /// Longitude is in [−180, 180).
     public static func subsolarPoint(date: Date) -> SubsolarPoint {
-        let utc = TimeZone.gmt
-        let comps = calendar.dateComponents(in: utc, from: date)
-        let jd = julianDay(year: comps.year ?? 2000, month: comps.month ?? 1, day: comps.day ?? 1)
-        let t = (jd - 2451545.0) / 36525.0
-        let elements = solarElements(t: t)
-
-        let minutesUTC = Double(comps.hour ?? 0) * 60 + Double(comps.minute ?? 0) + Double(comps.second ?? 0) / 60.0
-        // Solar noon is at longitude where true solar time is 720 minutes.
-        var lon = (720 - minutesUTC - elements.eqTime) / 4
-        while lon < -180 { lon += 360 }
-        while lon > 180 { lon -= 360 }
+        let elements = solarElements(at: date)
+        let comps = gregorianUTC.dateComponents([.hour, .minute, .second], from: date)
+        let utcHours = Double(comps.hour ?? 0) + Double(comps.minute ?? 0) / 60 + Double(comps.second ?? 0) / 3600
+        // Longitude where true solar time is 12 h.
+        var lon = -15.0 * (utcHours + elements.eqTime / 60.0 - 12.0)
+        lon = lon.truncatingRemainder(dividingBy: 360)
+        if lon < -180 { lon += 360 }
+        if lon >= 180 { lon -= 360 }
         return SubsolarPoint(latitude: elements.declin, longitude: lon)
     }
 
     /// Hours of daylight at a latitude on a date — depends only on latitude and
-    /// solar declination. 0 for polar night, 24 for midnight sun.
+    /// solar declination (evaluated at 0 h UT of the UTC date). 0 for polar
+    /// night, 24 for midnight sun.
     public static func daylightHours(latitude: Double, date: Date) -> Double {
-        let comps = calendar.dateComponents(in: TimeZone.gmt, from: date)
+        let comps = gregorianUTC.dateComponents([.year, .month, .day], from: date)
         let jd = julianDay(year: comps.year ?? 2000, month: comps.month ?? 1, day: comps.day ?? 1)
         let t = (jd - 2451545.0) / 36525.0
         let declin = solarElements(t: t).declin
@@ -698,9 +702,19 @@ public struct SolarCalculator: Sendable {
         let eqTime: Double
     }
 
+    /// Solar elements at Julian day `jd`.
+    private static func solarElements(julianDay jd: Double) -> SolarElements {
+        solarElements(t: (jd - 2451545.0) / 36525.0)
+    }
+
+    /// Solar elements at an exact instant (position/elevation/subsolar queries).
+    private static func solarElements(at instant: Date) -> SolarElements {
+        solarElements(julianDay: instant.timeIntervalSince1970 / 86_400.0 + 2_440_587.5)
+    }
+
     /// Compute solar declination and equation of time from a Julian century value.
-    /// `sunTimes`, `sunTimeForZenith`, `solarElevation`, and `solarPosition`
-    /// all need these two quantities before diverging into their own geometry.
+    /// Sun times, solar elevation/position and the subsolar point all need
+    /// these two quantities before diverging into their own geometry.
     private static func solarElements(t: Double) -> SolarElements {
         let l0 = (280.46646 + t * (36000.76983 + 0.0003032 * t)).truncatingRemainder(dividingBy: 360)
         let m = 357.52911 + t * (35999.05029 - 0.0001537 * t)
@@ -772,6 +786,6 @@ public struct SolarCalculator: Sendable {
         components.minute = minutes
         components.timeZone = TimeZone(identifier: "UTC")
 
-        return calendar.date(from: components) ?? Date()
+        return gregorianUTC.date(from: components) ?? Date()
     }
 }
