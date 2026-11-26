@@ -144,6 +144,16 @@ public struct SolarCalculator: Sendable {
             }
         }
 
+        /// SF Symbol for the level: a small sun, a full sun, then a sun with a
+        /// warning badge from very high up.
+        public var symbolName: String {
+            switch self {
+            case .low: return "sun.min.fill"
+            case .moderate, .high: return "sun.max.fill"
+            case .veryHigh, .extreme: return "sun.max.trianglebadge.exclamationmark.fill"
+            }
+        }
+
         public static func from(uvIndex: Double) -> UVLevel {
             switch uvIndex {
             case ..<3: return .low
@@ -376,6 +386,65 @@ public struct SolarCalculator: Sendable {
     /// the same result. Returns nil during polar day or polar night.
     public static func sunTimes(date: Date, latitude: Double, longitude: Double, timeZone: TimeZone = .current) -> SunTimes? {
         sunTimes(anchor: dayAnchor(for: date, longitude: longitude, timeZone: timeZone), latitude: latitude, longitude: longitude)
+    }
+
+    /// A single sunrise or sunset.
+    public struct SunEvent: Sendable, Hashable {
+        public enum Kind: String, Sendable, Hashable, CaseIterable {
+            case sunrise
+            case sunset
+        }
+
+        public let kind: Kind
+        public let time: Date
+
+        public init(kind: Kind, time: Date) {
+            self.kind = kind
+            self.time = time
+        }
+    }
+
+    /// Sunrises and sunsets strictly after `date`, in time order, over the
+    /// local calendar days (in `timeZone`) from the day before `date` through
+    /// `days` days after it. Starting a day early catches a sunset that falls
+    /// after local midnight at high latitudes. Pass `until` to drop events after
+    /// it. Days in polar day or polar night add nothing, so the result is empty
+    /// during a long polar period.
+    public static func upcomingSunEvents(
+        after date: Date,
+        until end: Date? = nil,
+        latitude: Double,
+        longitude: Double,
+        timeZone: TimeZone = .current,
+        days: Int = 3
+    ) -> [SunEvent] {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        let today = calendar.startOfDay(for: date)
+        var events: [SunEvent] = []
+        for offset in -1...max(days, 0) {
+            guard let dayStart = calendar.date(byAdding: .day, value: offset, to: today),
+                  let midday = calendar.date(byAdding: .hour, value: 12, to: dayStart),
+                  let times = sunTimes(date: midday, latitude: latitude, longitude: longitude, timeZone: timeZone)
+            else { continue }
+            events.append(SunEvent(kind: .sunrise, time: times.sunrise))
+            events.append(SunEvent(kind: .sunset, time: times.sunset))
+        }
+        return events
+            .filter { event in event.time > date && (end.map { event.time <= $0 } ?? true) }
+            .sorted { $0.time < $1.time }
+    }
+
+    /// The first sunrise or sunset after `date` within `days` local days, or
+    /// nil during a polar period longer than that.
+    public static func nextSunEvent(
+        after date: Date,
+        latitude: Double,
+        longitude: Double,
+        timeZone: TimeZone = .current,
+        days: Int = 3
+    ) -> SunEvent? {
+        upcomingSunEvents(after: date, latitude: latitude, longitude: longitude, timeZone: timeZone, days: days).first
     }
 
     private static func sunTimes(anchor: DayAnchor, latitude: Double, longitude: Double) -> SunTimes? {

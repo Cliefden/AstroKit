@@ -316,9 +316,15 @@ public struct MoonCalculator: Sendable {
     private static let deg = 180 / Double.pi
     /// Average lunar (synodic) month in days.
     public static let synodicMonth = 29.530588853
-    private static let averageDistance = 384400.0 // Average Moon distance in km
-    private static let perigeeDistance = 356500.0 // Approximate perigee
-    private static let apogeeDistance = 406700.0 // Approximate apogee
+    /// Reference Earth–Moon distances (km) that `lunarDistance(for:)` measures
+    /// against: `percentOfAverage` is relative to `averageDistance`, and the
+    /// perigee/apogee/supermoon statuses are bands around `perigeeDistance` and
+    /// `apogeeDistance`. Use them for gauges, so a scale lines up with the
+    /// statuses. They are reference values, not the series mean (which is
+    /// ≈384 953 km over 2025–2027).
+    public static let averageDistance = 384400.0
+    public static let perigeeDistance = 356500.0
+    public static let apogeeDistance = 406700.0
 
     // MARK: - Moon Phase Calculations
 
@@ -916,6 +922,33 @@ public struct MoonCalculator: Sendable {
     public static func upcomingEclipses(after date: Date, limit: Int = 5, calendar: Calendar) -> [EclipseEvent] {
         let startOfToday = calendar.startOfDay(for: date)
         return Array(allEclipses.filter { $0.date >= startOfToday }.prefix(max(0, limit)))
+    }
+
+    /// The central-line path of a total, annular or hybrid solar eclipse, if it
+    /// is in the path table (`eclipsePathCoverage`). Nil for partial and lunar
+    /// eclipses, which have no central line.
+    public static func eclipsePath(for event: EclipseEvent) -> EclipsePath? {
+        eclipsePath(onUTCDayOf: event.date)
+    }
+
+    /// The central-line path of the solar eclipse on the UTC calendar day
+    /// containing `date`, if one is in the path table.
+    public static func eclipsePath(onUTCDayOf date: Date) -> EclipsePath? {
+        let day = gregorianUTC.dateComponents([.year, .month, .day], from: date)
+        return EclipsePath.all.first {
+            $0.year == day.year && $0.month == day.month && $0.day == day.day
+        }
+    }
+
+    /// The first and last eclipse dates the path table covers. The eclipse
+    /// table (`eclipseTableCoverageEnd`) runs further, so central eclipses
+    /// after the path coverage have no path yet.
+    public static var eclipsePathCoverage: ClosedRange<Date>? {
+        let dates = EclipsePath.all.compactMap { path in
+            gregorianUTC.date(from: DateComponents(year: path.year, month: path.month, day: path.day))
+        }
+        guard let first = dates.min(), let last = dates.max() else { return nil }
+        return first...last
     }
 
     // MARK: - Julian Date Helpers
