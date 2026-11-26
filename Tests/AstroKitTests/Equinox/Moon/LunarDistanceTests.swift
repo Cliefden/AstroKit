@@ -29,6 +29,19 @@ final class LunarDistanceTests: XCTestCase {
         let average = totalDistance / Double(samples)
         // Average should be close to 384,400 km
         XCTAssertEqual(average, 384400, accuracy: 5000)
+
+        // Re-baselined for 0.2: the distance is Meeus eq. 47, Δ = 385,000.56 km
+        // + Σr (0.1 used a 384,400 km base and two wrong terms). Over three
+        // years of 6-hourly samples the periodic terms average out, so the
+        // mean must sit on the series' own base (0.2: 384,953 km; 0.1 gave
+        // 384,350 km).
+        var longTotal = 0.0
+        let longSamples = 3 * 365 * 4
+        for i in 0..<longSamples {
+            let date = TestDates.utc(year: 2025, month: 1, day: 1).addingTimeInterval(Double(i) * 21_600)
+            longTotal += MoonCalculator.lunarDistance(for: date).distanceKm
+        }
+        XCTAssertEqual(longTotal / Double(longSamples), 385_000.56, accuracy: 150)
     }
 
     // MARK: - Percent of Average Tests

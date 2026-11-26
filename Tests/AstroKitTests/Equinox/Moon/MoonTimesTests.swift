@@ -100,23 +100,34 @@ final class MoonTimesTests: XCTestCase {
         // Moonrise/moonset shifts approximately 50 minutes later each day
         let date1 = TestDates.utc(year: 2025, month: 3, day: 15)
         let date2 = TestDates.utc(year: 2025, month: 3, day: 16)
+        // Re-baselined for 0.2: scan New York's own day. It used the process
+        // time zone, so in zones west of New York (e.g. TZ=America/Los_Angeles)
+        // the ~01:45 EDT transit fell at the edge of the scanned local day and
+        // the comparison failed, in 0.1 as well as in 0.2. Expected New York
+        // transits: 01:45 EDT (Mar 15) and 02:25 EDT (Mar 16).
+        let tz = TimeZone(identifier: TestLocations.newYork.tz)!
 
         let times1 = MoonCalculator.moonTimes(
             date: date1,
             latitude: TestLocations.newYork.lat,
-            longitude: TestLocations.newYork.lon
+            longitude: TestLocations.newYork.lon,
+            timeZone: tz
         )
 
         let times2 = MoonCalculator.moonTimes(
             date: date2,
             latitude: TestLocations.newYork.lat,
-            longitude: TestLocations.newYork.lon
+            longitude: TestLocations.newYork.lon,
+            timeZone: tz
         )
 
         // If both days have transits, day 2 should be later
+        XCTAssertNotNil(times1.transitTime)
+        XCTAssertNotNil(times2.transitTime)
         if let transit1 = times1.transitTime, let transit2 = times2.transitTime {
             // Get minutes from midnight for comparison
-            let cal = Calendar.current
+            var cal = Calendar(identifier: .gregorian)
+            cal.timeZone = tz
             let mins1 = cal.component(.hour, from: transit1) * 60 + cal.component(.minute, from: transit1)
             let mins2 = cal.component(.hour, from: transit2) * 60 + cal.component(.minute, from: transit2)
 

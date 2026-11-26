@@ -2,7 +2,7 @@ import XCTest
 @testable import AstroKit
 
 /// Tests for MoonCalculator eclipse predictions
-/// Note: Uses pre-computed eclipse data for 2024-2030
+/// Note: Uses pre-computed eclipse data for 2025-2035 (UT greatest-eclipse instants since 0.2)
 final class EclipseTests: XCTestCase {
 
     // MARK: - Basic Functionality Tests
@@ -114,7 +114,13 @@ final class EclipseTests: XCTestCase {
         if let first = eclipses.first {
             XCTAssertEqual(first.type, .lunarTotal)
 
-            let cal = Calendar.current
+            // Re-baselined for 0.2: `date` is the UT instant of greatest
+            // eclipse (06:59 UT), no longer 12:00 in the device time zone, so
+            // the calendar day is checked in UTC. (West of UTC−7 the local
+            // date is March 13.)
+            XCTAssertEqual(first.date, TestDates.utc(year: 2025, month: 3, day: 14, hour: 6, minute: 59))
+            var cal = Calendar(identifier: .gregorian)
+            cal.timeZone = TimeZone(identifier: "UTC")!
             let month = cal.component(.month, from: first.date)
             let day = cal.component(.day, from: first.date)
 
@@ -178,6 +184,11 @@ final class EclipseTests: XCTestCase {
 
         // Should have many eclipses from 2025-2030
         XCTAssertGreaterThan(eclipses.count, 10)
+
+        // Re-baselined for 0.2: the whole table has 49 entries (0.1 had 44).
+        // Added: 2025-03-29 and 2025-09-21 partial solar, 2026-02-17 annular,
+        // 2026-03-03 total lunar, 2027-07-18 penumbral lunar.
+        XCTAssertEqual(MoonCalculator.upcomingEclipses(after: date, limit: 100).count, 49)
     }
 
     func test_upcomingEclipses_mid2035_returnsFewResults() {

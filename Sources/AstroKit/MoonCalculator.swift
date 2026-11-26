@@ -3,12 +3,13 @@ import Foundation
 /// Calculates lunar data including moon phases, moonrise/moonset, distance, and zodiac position.
 /// Based on Jean Meeus "Astronomical Algorithms".
 ///
-/// Ported from Equinox (`Shared/MoonCalculator.swift`), the reference
-/// implementation. Additions for Otta (`transits`, `moonPosition`,
-/// `MoonPhaseInfo.phaseAngle` / `illuminatedFraction`) and Lunker
-/// (`upcomingEclipses(after:limit:calendar:)`, `eclipseTableCoverageEnd`,
-/// `EclipseEvent: Identifiable`) reuse the same lunar position model, so every
-/// app gets identical numbers.
+/// API ported from Equinox (`Shared/MoonCalculator.swift`), with additions for
+/// Otta (`transits`, `moonPosition`, `MoonPhaseInfo.phaseAngle` /
+/// `illuminatedFraction`) and Lunker (`dayPhase`, `MoonPhase.symbolName` /
+/// `isWaxing`, `upcomingEclipses(after:limit:calendar:)`,
+/// `eclipseTableCoverageEnd`, `EclipseEvent: Identifiable`). Since 0.2 the
+/// numbers follow Lunker's implementation (elongation-based phase, Meeus
+/// distance series, DST-exact last-crossing moon times, UT eclipse instants).
 public struct MoonCalculator: Sendable {
 
     // MARK: - Moon Phase Types
@@ -23,6 +24,8 @@ public struct MoonCalculator: Sendable {
         case lastQuarter = "Last Quarter"
         case waningCrescent = "Waning Crescent"
 
+        /// Equinox's generic moon symbols (kept for compatibility). For a
+        /// symbol that shows the actual phase, use `symbolName`.
         public var icon: String {
             switch self {
             case .newMoon: return "moon.fill"
@@ -33,6 +36,30 @@ public struct MoonCalculator: Sendable {
             case .waningGibbous: return "moon.haze.fill"
             case .lastQuarter: return "moon.haze.fill"
             case .waningCrescent: return "moon.stars.fill"
+            }
+        }
+
+        /// The phase-accurate `moonphase.*` SF Symbol (iOS 17 / watchOS 10).
+        public var symbolName: String {
+            switch self {
+            case .newMoon: return "moonphase.new.moon"
+            case .waxingCrescent: return "moonphase.waxing.crescent"
+            case .firstQuarter: return "moonphase.first.quarter"
+            case .waxingGibbous: return "moonphase.waxing.gibbous"
+            case .fullMoon: return "moonphase.full.moon"
+            case .waningGibbous: return "moonphase.waning.gibbous"
+            case .lastQuarter: return "moonphase.last.quarter"
+            case .waningCrescent: return "moonphase.waning.crescent"
+            }
+        }
+
+        /// Lit fraction growing (new → full), for drawing the terminator.
+        public var isWaxing: Bool {
+            switch self {
+            case .newMoon, .waxingCrescent, .firstQuarter, .waxingGibbous:
+                return true
+            case .fullMoon, .waningGibbous, .lastQuarter, .waningCrescent:
+                return false
             }
         }
 
@@ -278,9 +305,13 @@ public struct MoonCalculator: Sendable {
 
     // MARK: - Constants
 
-    // Astronomical date arithmetic must be Gregorian: locales like ar-SA default
-    // to a lunar calendar whose year/month components would corrupt the algorithms.
-    private static let calendar = Calendar(identifier: .gregorian)
+    /// Gregorian/UTC calendar for astronomical date math. `Calendar.current`
+    /// may be non-Gregorian (ar-SA, th-TH, ja-JP…) or in an unrelated zone.
+    private static let gregorianUTC: Calendar = {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC") ?? TimeZone(secondsFromGMT: 0)!
+        return cal
+    }()
     private static let rad = Double.pi / 180
     private static let deg = 180 / Double.pi
     /// Average lunar (synodic) month in days.
@@ -289,22 +320,23 @@ public struct MoonCalculator: Sendable {
     private static let perigeeDistance = 356500.0 // Approximate perigee
     private static let apogeeDistance = 406700.0 // Approximate apogee
 
-    // Reference new moon: January 6, 2000, 18:14 UTC (JD at noon + 6.23 hours)
-    private static let referenceNewMoon = 2451550.26
-
     // MARK: - Moon Phase Calculations
 
-    /// Calculate moon phase information for a given date
+    /// The phase that represents a whole local day: sampled at its midday, so
+    /// a phase change late in the evening doesn't relabel the day.
+    /// `dayStart` is the location's midnight.
+    public static func dayPhase(for dayStart: Date) -> MoonPhaseInfo {
+        moonPhase(for: dayStart.addingTimeInterval(12 * 3600))
+    }
+
+    /// Calculate moon phase information for a given date.
+    ///
+    /// Illumination, age, phase name and the next new/full moon all derive
+    /// from the same sun→moon elongation, so the label never disagrees with
+    /// the lit fraction.
     public static func moonPhase(for date: Date) -> MoonPhaseInfo {
         let jd = julianDay(from: date)
         let t = (jd - 2451545.0) / 36525.0
-
-        // Calculate days since reference new moon (for age and phase name)
-        let daysSinceNew = jd - referenceNewMoon
-
-        // Moon age (position in current synodic month)
-        let age = daysSinceNew.truncatingRemainder(dividingBy: synodicMonth)
-        let normalizedAge = age < 0 ? age + synodicMonth : age
 
         // === Calculate Moon's ecliptic longitude ===
         let Lp = (218.3164477 + 481267.88123421 * t).truncatingRemainder(dividingBy: 360)
@@ -338,6 +370,11 @@ public struct MoonCalculator: Sendable {
         // Illumination from elongation: k = (1 - cos(elongation)) / 2
         let illumination = (1 - cos(elongation * rad)) / 2
 
+        // Age, phase name and next-phase dates come from the SAME elongation
+        // that drives illumination (0° = new, 180° = full, sweeping 360° over
+        // one synodic month).
+        let normalizedAge = (elongation / 360) * synodicMonth
+
         // Determine phase name
         let phase = phaseFromAge(normalizedAge)
 
@@ -364,22 +401,32 @@ public struct MoonCalculator: Sendable {
         )
     }
 
-    /// Determine moon phase from age in days
+    /// Determine moon phase from age in days.
+    /// Each of the eight bins is *centred* on its event (new at age 0, first
+    /// quarter at ¼, full at ½, …), so e.g. "Full Moon" spans ±1.85 days around
+    /// the instant of full moon rather than starting at it.
     private static func phaseFromAge(_ age: Double) -> MoonPhase {
-        let dayInCycle = age.truncatingRemainder(dividingBy: synodicMonth)
-        // Center each named phase on its 1/8 bucket (round to the nearest eighth) so the
-        // new/quarter/full instants are not reported up to ~1.8 days late by sitting at a
-        // bucket's leading edge.
-        let index = Int((dayInCycle / synodicMonth * 8).rounded()) % 8
-        switch index {
-        case 0: return .newMoon
-        case 1: return .waxingCrescent
-        case 2: return .firstQuarter
-        case 3: return .waxingGibbous
-        case 4: return .fullMoon
-        case 5: return .waningGibbous
-        case 6: return .lastQuarter
-        default: return .waningCrescent
+        let phaseLength = synodicMonth / 8
+        var dayInCycle = (age + phaseLength / 2).truncatingRemainder(dividingBy: synodicMonth)
+        if dayInCycle < 0 { dayInCycle += synodicMonth }
+
+        switch dayInCycle {
+        case 0..<phaseLength:
+            return .newMoon
+        case phaseLength..<(2 * phaseLength):
+            return .waxingCrescent
+        case (2 * phaseLength)..<(3 * phaseLength):
+            return .firstQuarter
+        case (3 * phaseLength)..<(4 * phaseLength):
+            return .waxingGibbous
+        case (4 * phaseLength)..<(5 * phaseLength):
+            return .fullMoon
+        case (5 * phaseLength)..<(6 * phaseLength):
+            return .waningGibbous
+        case (6 * phaseLength)..<(7 * phaseLength):
+            return .lastQuarter
+        default:
+            return .waningCrescent
         }
     }
 
@@ -393,14 +440,26 @@ public struct MoonCalculator: Sendable {
     // Moon's average semi-diameter
     private static let moonSemiDiameter = 0.26
     // The horizon altitude for moonrise/moonset (upper limb touching horizon)
-    // = -parallax + refraction + semi-diameter
+    // = -parallax + refraction + semi-diameter ≈ -0.12°.
+    // (The textbook value is +parallax − refraction − semi-diameter ≈ +0.125°;
+    // the sign is kept as-is because Equinox and Lunker both ship it — see
+    // README "Candidates for a later accuracy release".)
     private static let moonHorizonAltitude = -moonParallax + refractionAtHorizon + moonSemiDiameter // ≈ -0.12°
 
-    /// Calculate moonrise and moonset times for a given date and location
+    /// Calculate moonrise and moonset times for a given date and location.
+    ///
+    /// `timeZone` selects which local day is scanned: from midnight in the
+    /// location's own zone to the next local midnight (so 23 h / 25 h
+    /// DST-transition days are covered exactly). When the moon crosses the
+    /// horizon twice in one day (high latitudes), the **last** crossing of
+    /// each kind is reported. `transitTime` is the highest 5-minute sample
+    /// strictly before the next midnight.
     public static func moonTimes(date: Date, latitude: Double, longitude: Double, timeZone: TimeZone = .current) -> MoonTimes {
-        var cal = calendar
+        var cal = Calendar(identifier: .gregorian)
         cal.timeZone = timeZone
         let startOfDay = cal.startOfDay(for: date)
+        let endOfDay = cal.date(byAdding: .day, value: 1, to: startOfDay) ?? startOfDay.addingTimeInterval(86_400)
+        let dayMinutes = Int((endOfDay.timeIntervalSince(startOfDay) / 60).rounded())
 
         var moonrise: Date?
         var moonset: Date?
@@ -411,20 +470,25 @@ public struct MoonCalculator: Sendable {
         var prevAltitude: Double?
         var prevTime: Date?
 
-        for minutes in stride(from: 0, through: 1440, by: 5) {
+        for minutes in stride(from: 0, through: dayMinutes, by: 5) {
             let checkTime = startOfDay.addingTimeInterval(Double(minutes) * 60)
             let position = lunarPosition(at: checkTime, latitude: latitude, longitude: longitude)
             let altitude = position.altitude
 
-            // Track transit (highest point)
-            if altitude > maxAltitude {
+            // Track transit (highest point). Exclude the final sample at the
+            // NEXT day's midnight: a transit there belongs to tomorrow. (The
+            // sample is still used for rise/set crossing detection in the last
+            // 5-minute window of today.)
+            if altitude > maxAltitude && minutes < dayMinutes {
                 maxAltitude = altitude
                 transitTime = checkTime
             }
 
             if let prev = prevAltitude, let prevT = prevTime {
-                // Moon rising (crossed horizon altitude from below)
-                if prev < moonHorizonAltitude && altitude >= moonHorizonAltitude && moonrise == nil {
+                // Moon rising (crossed horizon altitude from below). No
+                // `== nil` guard: at high latitudes the moon can briefly dip
+                // below and rise again; overwriting keeps the LAST (main) rise.
+                if prev < moonHorizonAltitude && altitude >= moonHorizonAltitude {
                     moonrise = refineHorizonCrossing(
                         startTime: prevT,
                         endTime: checkTime,
@@ -433,8 +497,8 @@ public struct MoonCalculator: Sendable {
                         isRising: true
                     )
                 }
-                // Moon setting (crossed horizon altitude from above)
-                if prev >= moonHorizonAltitude && altitude < moonHorizonAltitude && moonset == nil {
+                // Moon setting (crossed horizon altitude from above). Same reasoning.
+                if prev >= moonHorizonAltitude && altitude < moonHorizonAltitude {
                     moonset = refineHorizonCrossing(
                         startTime: prevT,
                         endTime: checkTime,
@@ -497,7 +561,7 @@ public struct MoonCalculator: Sendable {
     /// transit falls on a neighbouring day) the edge sample is returned
     /// unrefined, matching Otta's `LunarCalculator.transits`.
     public static func transits(date: Date, latitude: Double, longitude: Double, timeZone: TimeZone = .current) -> MoonTransits {
-        var cal = calendar
+        var cal = Calendar(identifier: .gregorian)
         cal.timeZone = timeZone
         let start = cal.startOfDay(for: date)
 
@@ -597,13 +661,14 @@ public struct MoonCalculator: Sendable {
             sin(latRad) * cos(oblRad) + cos(latRad) * sin(oblRad) * sin(lonRad)
         ) * deg
 
-        // Calculate altitude and azimuth
+        // Calculate altitude and azimuth (reuse the jd/t already computed above)
         let (altitude, azimuth) = calculateAltAz(
             rightAscension: rightAscension,
             declination: declination,
             latitude: latitude,
             longitude: longitude,
-            time: time
+            jd: jd,
+            t: t
         )
 
         // Determine zodiac constellation
@@ -619,12 +684,9 @@ public struct MoonCalculator: Sendable {
         )
     }
 
-    /// Calculate altitude and azimuth from equatorial coordinates
-    private static func calculateAltAz(rightAscension: Double, declination: Double, latitude: Double, longitude: Double, time: Date) -> (altitude: Double, azimuth: Double) {
-        // Calculate Local Sidereal Time
-        let jd = julianDay(from: time)
-        let t = (jd - 2451545.0) / 36525.0
-
+    /// Calculate altitude and azimuth from equatorial coordinates, given the
+    /// Julian day and Julian century already computed by the caller.
+    private static func calculateAltAz(rightAscension: Double, declination: Double, latitude: Double, longitude: Double, jd: Double, t: Double) -> (altitude: Double, azimuth: Double) {
         // Greenwich Mean Sidereal Time
         let gmst = 280.46061837 + 360.98564736629 * (jd - 2451545.0) + 0.000387933 * t * t
 
@@ -655,8 +717,10 @@ public struct MoonCalculator: Sendable {
 
     /// Determine zodiac constellation from ecliptic longitude
     private static func zodiacFromLongitude(_ longitude: Double) -> ZodiacConstellation {
-        let normalizedLon = longitude.truncatingRemainder(dividingBy: 360)
-        // Clamp defensively: longitude == 360 or a negative input would otherwise index out of bounds.
+        // Normalize into [0, 360) first — truncatingRemainder keeps the sign, so a
+        // negative longitude would otherwise produce a negative (out-of-bounds) index.
+        var normalizedLon = longitude.truncatingRemainder(dividingBy: 360)
+        if normalizedLon < 0 { normalizedLon += 360 }
         let index = min(11, max(0, Int(normalizedLon / 30)))
         return ZodiacConstellation.allCases[index]
     }
@@ -674,8 +738,8 @@ public struct MoonCalculator: Sendable {
         let Ms = (357.5291092 + 35999.0502909 * t).truncatingRemainder(dividingBy: 360) * rad  // Sun's mean anomaly
         let F = (93.2720950 + 483202.0175233 * t).truncatingRemainder(dividingBy: 360) * rad   // Argument of latitude
 
-        // Distance calculation using periodic terms (Jean Meeus, Chapter 47)
-        // Sum of cosine terms gives distance correction in km.
+        // Largest Σr terms of Meeus Table 47.A (M here = Moon's anomaly M′,
+        // Ms = Sun's anomaly M; the E eccentricity factor is omitted).
         // Split into two sums to keep the type checker fast.
         let mainTerms: Double =
             -20905.355 * cos(M)
@@ -685,18 +749,25 @@ public struct MoonCalculator: Sendable {
             + 48.888 * cos(Ms)
             - 3.149 * cos(2 * F)
             + 246.158 * cos(2 * D - 2 * M)
-            - 152.138 * cos(2 * D + M - Ms)
-        let minorTerms: Double =
-            -170.733 * cos(2 * D + M)
+            - 152.138 * cos(2 * D - Ms - M)
+            - 170.733 * cos(2 * D + M)
             - 204.586 * cos(2 * D - Ms)
-            - 129.620 * cos(M - Ms)
+            - 129.620 * cos(Ms - M)
             + 108.743 * cos(D)
-            + 104.755 * cos(M + Ms)
-            + 79.661 * cos(2 * D - 2 * F)
-            + 48.888 * cos(Ms - M)
+            + 104.755 * cos(Ms + M)
+        let minorTerms: Double =
+            10.321 * cos(2 * D - 2 * F)
+            + 79.661 * cos(M - 2 * F)
+            - 34.782 * cos(4 * D - M)
+            - 23.210 * cos(3 * M)
+            - 21.636 * cos(4 * D - 2 * M)
+            + 24.208 * cos(2 * D + Ms - M)
+            + 30.824 * cos(2 * D + Ms)
         let distanceTerms = mainTerms + minorTerms
 
-        let distance = averageDistance + distanceTerms
+        // Meeus eq. 47: Δ = 385000.56 km + Σr (the series' own mean, not the
+        // 384400 km semi-major axis used for percentOfAverage below).
+        let distance = 385000.56 + distanceTerms
 
         // Calculate status
         let percentOfAverage = (distance / averageDistance) * 100
@@ -715,8 +786,10 @@ public struct MoonCalculator: Sendable {
 
         // Calculate next perigee and apogee (approximate)
         let anomalyPeriod = 27.55455 // Anomalistic month in days
-        // M above is in radians; recover the mean anomaly in degrees, normalized to 0..<360
-        let currentAnomaly = ((M * deg).truncatingRemainder(dividingBy: 360) + 360).truncatingRemainder(dividingBy: 360)
+        // M is in radians; recover the mean anomaly in degrees, normalized to 0..<360
+        // (only negative before J2000, where the fold is needed).
+        var currentAnomaly = (M * deg).truncatingRemainder(dividingBy: 360)
+        if currentAnomaly < 0 { currentAnomaly += 360 }
 
         // Perigee occurs at anomaly = 0°
         let daysToPerigee = ((360 - currentAnomaly).truncatingRemainder(dividingBy: 360) / 360) * anomalyPeriod
@@ -743,83 +816,94 @@ public struct MoonCalculator: Sendable {
 
     // MARK: - Eclipse Predictions
 
-    /// Known eclipses 2025-2035. Dates (UTC) and types from NASA GSFC's
-    /// Five Millennium Canon of solar and lunar eclipses (Espenak & Meeus).
-    /// Visibility is a broad "where to look" summary. Omitted: the 2027-07-18
-    /// penumbral lunar eclipse (magnitude ~0.001, not observable).
+    /// Every solar (total/annular/hybrid/partial) and lunar
+    /// (total/partial/penumbral) eclipse from 2025 through 2035, in
+    /// chronological order, at the instant of greatest eclipse (UT, rounded to
+    /// the minute — NASA tables quote TD, which runs ~74 s ahead) per the
+    /// NASA/Espenak eclipse catalogues (Lunker's table). Visibility strings are
+    /// broad regions only, and are English keys looked up in the host app's
+    /// main-bundle string catalog.
     ///
-    /// NOTE: this is Equinox's table, kept verbatim. Lunker's table additionally
-    /// lists 2025-03-29, 2025-09-21, 2026-02-17 (solar) and 2026-03-03 (lunar)
-    /// with greatest-eclipse instants — see README "Numeric discrepancies".
-    private static let knownEclipses: [(type: EclipseEvent.EclipseType, year: Int, month: Int, day: Int, visibility: String)] = [
-        (.lunarTotal, 2025, 3, 14, "Americas, Europe, Africa"),
-        (.lunarTotal, 2025, 9, 7, "Europe, Africa, Asia, Australia"),
-        (.solarTotal, 2026, 8, 12, "Arctic, Greenland, Iceland, Spain"),
-        (.lunarPartial, 2026, 8, 28, "Americas, Europe, Africa"),
-        (.solarAnnular, 2027, 2, 6, "South America, Africa, Antarctica"),
-        (.lunarPenumbral, 2027, 2, 20, "Americas, Europe, Africa, Asia"),
-        (.solarTotal, 2027, 8, 2, "Africa, Europe, Middle East"),
-        (.lunarPenumbral, 2027, 8, 17, "Americas, Pacific"),
-        (.lunarPartial, 2028, 1, 12, "Americas, Europe, Africa"),
-        (.solarAnnular, 2028, 1, 26, "South America, Antarctica"),
-        (.lunarPartial, 2028, 7, 6, "Europe, Africa, Asia, Australia"),
-        (.solarTotal, 2028, 7, 22, "Australia, New Zealand"),
-        (.lunarTotal, 2028, 12, 31, "Europe, Africa, Asia, Australia"),
-        (.solarPartial, 2029, 1, 14, "North America, Central America"),
-        (.solarPartial, 2029, 6, 12, "Arctic, Scandinavia, Alaska, Northern Asia"),
-        (.lunarTotal, 2029, 6, 26, "Americas, Europe, Africa"),
-        (.solarPartial, 2029, 7, 11, "Southern South America"),
-        (.solarPartial, 2029, 12, 5, "South America, Antarctica"),
-        (.lunarTotal, 2029, 12, 20, "Americas, Europe, Africa, Asia"),
-        (.solarAnnular, 2030, 6, 1, "North Africa, SE Europe, Russia, Japan"),
-        (.lunarPartial, 2030, 6, 15, "Europe, Africa, Asia, Australia"),
-        (.solarTotal, 2030, 11, 25, "Namibia, South Africa, Indian Ocean, SE Australia"),
-        (.lunarPenumbral, 2030, 12, 9, "Americas, Europe, Africa, Asia"),
-        (.lunarPenumbral, 2031, 5, 7, "Americas, Europe, Africa"),
-        (.solarAnnular, 2031, 5, 21, "Africa, South Asia, Indonesia"),
-        (.lunarPenumbral, 2031, 6, 5, "East Asia, Australia, Pacific"),
-        (.lunarPenumbral, 2031, 10, 30, "Americas, Pacific"),
-        (.solarHybrid, 2031, 11, 14, "Pacific, Central America, South America"),
-        (.lunarTotal, 2032, 4, 25, "Africa, Asia, Australia"),
-        (.solarAnnular, 2032, 5, 9, "South Atlantic, Southern Africa"),
-        (.lunarTotal, 2032, 10, 18, "Europe, Africa, Asia, Australia"),
-        (.solarPartial, 2032, 11, 3, "Asia"),
-        (.solarTotal, 2033, 3, 30, "Alaska, Eastern Russia, Arctic"),
-        (.lunarTotal, 2033, 4, 14, "Europe, Africa, Asia, Australia"),
-        (.solarPartial, 2033, 9, 23, "South America, Antarctica"),
-        (.lunarTotal, 2033, 10, 8, "Asia, Australia, Pacific, Americas"),
-        (.solarTotal, 2034, 3, 20, "Africa, Middle East, South Asia"),
-        (.lunarPenumbral, 2034, 4, 3, "Europe, Africa, Asia, Australia"),
-        (.solarAnnular, 2034, 9, 12, "South America"),
-        (.lunarPartial, 2034, 9, 28, "Americas, Europe, Africa"),
-        (.lunarPenumbral, 2035, 2, 22, "Asia, Australia, Pacific, Americas"),
-        (.solarAnnular, 2035, 3, 9, "New Zealand, South Pacific"),
-        (.lunarPartial, 2035, 8, 19, "Americas, Europe, Africa"),
-        (.solarTotal, 2035, 9, 2, "China, Korea, Japan, Pacific"),
+    /// Coverage ends with the 2035-09-02 total solar eclipse (see
+    /// `eclipseTableCoverageEnd`); extend the table well before then, or the
+    /// upcoming-eclipse list quietly runs dry.
+    private static let knownEclipses: [(type: EclipseEvent.EclipseType, year: Int, month: Int, day: Int, hour: Int, minute: Int, visibility: String)] = [
+        (.lunarTotal, 2025, 3, 14, 6, 59, "Americas, Europe, Africa"),
+        (.solarPartial, 2025, 3, 29, 10, 47, "Europe, N. Africa, N. Russia, NE North America"),
+        (.lunarTotal, 2025, 9, 7, 18, 12, "Europe, Africa, Asia, Australia"),
+        (.solarPartial, 2025, 9, 21, 19, 42, "New Zealand, Antarctica, S. Pacific"),
+        (.solarAnnular, 2026, 2, 17, 12, 12, "Antarctica, S. Africa, S. South America"),
+        (.lunarTotal, 2026, 3, 3, 11, 34, "Asia, Australia, Pacific, Americas"),
+        (.solarTotal, 2026, 8, 12, 17, 46, "Arctic, Greenland, Iceland, Spain"),
+        (.lunarPartial, 2026, 8, 28, 4, 13, "Americas, Europe, Africa"),
+        (.solarAnnular, 2027, 2, 6, 16, 0, "South America, Africa, Antarctica"),
+        (.lunarPenumbral, 2027, 2, 20, 23, 13, "Americas, Europe, Africa, Asia"),
+        (.lunarPenumbral, 2027, 7, 18, 16, 3, "Asia, Australia, Pacific"),
+        (.solarTotal, 2027, 8, 2, 10, 7, "Africa, Europe, Middle East"),
+        (.lunarPenumbral, 2027, 8, 17, 7, 14, "Americas, Pacific"),
+        (.lunarPartial, 2028, 1, 12, 4, 13, "Americas, Europe, Africa"),
+        (.solarAnnular, 2028, 1, 26, 15, 8, "Americas, W. Europe, W. Africa"),
+        (.lunarPartial, 2028, 7, 6, 18, 20, "Europe, Africa, Asia, Australia"),
+        (.solarTotal, 2028, 7, 22, 2, 55, "Australia, New Zealand"),
+        (.lunarTotal, 2028, 12, 31, 16, 52, "Europe, Africa, Asia, Australia"),
+        (.solarPartial, 2029, 1, 14, 17, 13, "North America, Central America"),
+        (.solarPartial, 2029, 6, 12, 4, 5, "Arctic, Scandinavia, Alaska, N. Asia, Canada"),
+        (.lunarTotal, 2029, 6, 26, 3, 22, "Americas, Europe, Africa"),
+        (.solarPartial, 2029, 7, 11, 15, 36, "Southern South America"),
+        (.solarPartial, 2029, 12, 5, 15, 3, "Southern South America, Antarctica"),
+        (.lunarTotal, 2029, 12, 20, 22, 42, "Americas, Europe, Africa, Asia"),
+        (.solarAnnular, 2030, 6, 1, 6, 28, "N. Africa, Europe, Middle East, Central Asia"),
+        (.lunarPartial, 2030, 6, 15, 18, 33, "Europe, Africa, Asia, Australia"),
+        (.solarTotal, 2030, 11, 25, 6, 50, "S. Africa, S. Atlantic, S. Australia"),
+        (.lunarPenumbral, 2030, 12, 9, 22, 28, "Americas, Europe, Africa, Asia"),
+        (.lunarPenumbral, 2031, 5, 7, 3, 51, "Americas, Europe, Africa, Middle East"),
+        (.solarAnnular, 2031, 5, 21, 7, 15, "Africa, S. India, SE Asia"),
+        (.lunarPenumbral, 2031, 6, 5, 11, 44, "Asia, Australia, Pacific"),
+        (.lunarPenumbral, 2031, 10, 30, 7, 45, "Americas, Pacific"),
+        (.solarHybrid, 2031, 11, 14, 21, 6, "Pacific, Central America, NW South America"),
+        (.lunarTotal, 2032, 4, 25, 15, 14, "Asia, Australia, Pacific"),
+        (.solarAnnular, 2032, 5, 9, 13, 25, "S. Atlantic, S. Africa, Antarctica"),
+        (.lunarTotal, 2032, 10, 18, 19, 2, "Europe, Africa, Asia, Australia"),
+        (.solarPartial, 2032, 11, 3, 5, 33, "Asia"),
+        (.solarTotal, 2033, 3, 30, 18, 1, "Alaska, Arctic, N. Russia"),
+        (.lunarTotal, 2033, 4, 14, 19, 13, "Europe, Africa, Asia, Australia"),
+        (.solarPartial, 2033, 9, 23, 13, 53, "S. South America, Antarctica"),
+        (.lunarTotal, 2033, 10, 8, 10, 55, "Asia, Australia, Pacific, Americas"),
+        (.solarTotal, 2034, 3, 20, 10, 18, "Africa, Middle East, S. Asia"),
+        (.lunarPenumbral, 2034, 4, 3, 19, 6, "Europe, Africa, Asia, Australia"),
+        (.solarAnnular, 2034, 9, 12, 16, 18, "Pacific, South America, Atlantic"),
+        (.lunarPartial, 2034, 9, 28, 2, 46, "Americas, Europe, Africa"),
+        (.lunarPenumbral, 2035, 2, 22, 9, 5, "E. Asia, Australia, Pacific, Americas"),
+        (.solarAnnular, 2035, 3, 9, 23, 5, "Australia, New Zealand, Pacific"),
+        (.lunarPartial, 2035, 8, 19, 1, 11, "Americas, Europe, Africa"),
+        (.solarTotal, 2035, 9, 2, 1, 56, "China, Korea, Japan, Pacific"),
     ]
 
-    /// All table entries as events, in chronological order. Each `date` is
-    /// 12:00 on the eclipse's calendar day in the device's time zone
-    /// (Equinox's convention).
+    /// All table entries as events, in chronological order. Each `date` is the
+    /// UT instant of greatest eclipse; `visibility` is localized through the
+    /// host app's main bundle (falling back to the English key).
     private static var allEclipses: [EclipseEvent] {
         knownEclipses.compactMap { eclipse in
             var components = DateComponents()
             components.year = eclipse.year
             components.month = eclipse.month
             components.day = eclipse.day
-            components.hour = 12
-            guard let eclipseDate = calendar.date(from: components) else { return nil }
-            return EclipseEvent(type: eclipse.type, date: eclipseDate, visibility: eclipse.visibility)
+            components.hour = eclipse.hour
+            components.minute = eclipse.minute
+            guard let eclipseDate = gregorianUTC.date(from: components) else { return nil }
+            let visibility = NSLocalizedString(eclipse.visibility, bundle: .main, comment: "Eclipse visibility regions")
+            return EclipseEvent(type: eclipse.type, date: eclipseDate, visibility: visibility)
         }
     }
 
-    /// The last instant covered by the eclipse table. Extend the table well
-    /// before this date, or the upcoming-eclipse list quietly runs dry.
+    /// The last instant covered by the eclipse table (2035-09-02 01:56 UT).
+    /// Extend the table well before this date, or the upcoming-eclipse list
+    /// quietly runs dry.
     public static var eclipseTableCoverageEnd: Date? {
         allEclipses.last?.date
     }
 
-    /// Get upcoming eclipses (pre-computed known eclipses) strictly after `date`.
+    /// Upcoming eclipses (pre-computed known eclipses) strictly after `date`.
     /// Note: Full eclipse prediction requires complex calculations; this uses known upcoming eclipses
     public static func upcomingEclipses(after date: Date, limit: Int = 5) -> [EclipseEvent] {
         Array(allEclipses.filter { $0.date > date }.prefix(max(0, limit)))
@@ -827,7 +911,8 @@ public struct MoonCalculator: Sendable {
 
     /// Lunker's variant: an eclipse stays listed for the whole calendar day (in
     /// `calendar`) on which it occurs, rather than vanishing once its instant
-    /// has passed.
+    /// has passed. Because each date is the UT instant of greatest eclipse,
+    /// it lands on the right local day in every zone (UTC+12…+14 included).
     public static func upcomingEclipses(after date: Date, limit: Int = 5, calendar: Calendar) -> [EclipseEvent] {
         let startOfToday = calendar.startOfDay(for: date)
         return Array(allEclipses.filter { $0.date >= startOfToday }.prefix(max(0, limit)))
@@ -835,30 +920,9 @@ public struct MoonCalculator: Sendable {
 
     // MARK: - Julian Date Helpers
 
+    /// Julian day of an instant, including fractional seconds.
+    /// Unix epoch (1970-01-01 00:00 UTC) = JD 2440587.5.
     private static func julianDay(from date: Date) -> Double {
-        let cal = calendar
-        let utc = TimeZone(identifier: "UTC") ?? TimeZone(secondsFromGMT: 0)!
-        let components = cal.dateComponents(in: utc, from: date)
-
-        var year = components.year ?? 2000
-        var month = components.month ?? 1
-        let day = components.day ?? 1
-        let hour = components.hour ?? 0
-        let minute = components.minute ?? 0
-        let second = components.second ?? 0
-
-        let dayFraction = Double(hour) / 24.0 + Double(minute) / 1440.0 + Double(second) / 86400.0
-
-        if month <= 2 {
-            year -= 1
-            month += 12
-        }
-
-        let a = year / 100
-        let b = 2 - a + a / 4
-
-        return Double(Int(365.25 * Double(year + 4716))) +
-            Double(Int(30.6001 * Double(month + 1))) +
-            Double(day) + dayFraction + Double(b) - 1524.5
+        date.timeIntervalSince1970 / 86_400.0 + 2_440_587.5
     }
 }
