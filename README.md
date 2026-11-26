@@ -40,6 +40,7 @@ math**, so it diverges from 0.2 until it is ported (see "Equinox").
 | `lastEquinox/nextEquinox/lastSolstice/nextSolstice` | |
 | `solsticeMirrorDate(for:)` | The date with the same daylight on the other side of the next solstice. |
 | `sunTimes(date:latitude:longitude:timeZone:) -> SunTimes?` | Sunrise, sunset, solar noon and `daylightDuration` on the location's calendar day. Returns nil at the poles. |
+| `upcomingSunEvents(after:until:…timeZone:days:) -> [SunEvent]`, `nextSunEvent(after:…)` | **0.2.1.** Sunrises and sunsets strictly after an instant, in time order, from the day before through `days` local days ahead (default 3), optionally cut off at `until`. Empty during a polar period longer than the window. |
 | `polarState(...) -> PolarState?` | `.polarDay` / `.polarNight` (Lunker naming). Non-nil exactly when `sunTimes` is nil. |
 | `polarCondition(...) -> PolarCondition?` | `.midnightSun` / `.polarNight` (Equinox naming). Same answer as `polarState`. |
 | `twilightTimes(...) -> TwilightTimes?` | Civil 96°, nautical 102°, astronomical 108°. `sunrise`/`sunset` are non-optional, so it returns nil when the sun does not rise. |
@@ -49,7 +50,7 @@ math**, so it diverges from 0.2 until it is ported (see "Equinox").
 | `eventTimeClampingPolar(...) -> Date` | From Otta. Never nil: in polar day it returns noon ± 12 h, in polar night it returns solar noon. Used for legal hunting hours. |
 | `solarElevation(at:…)`, `solarPosition(at:…) -> SunPosition` | Elevation, plus azimuth clockwise from north. |
 | `sunPath(date:…intervalMinutes:timeZone:)` | Sun positions sampled from local midnight to the next local midnight (23/25 h on DST days). |
-| `maxSolarElevation`, `estimateUVIndex(elevation:)`, `uvLevel(from:)`, `UVLevel` | |
+| `maxSolarElevation`, `estimateUVIndex(elevation:)`, `uvLevel(from:)`, `UVLevel` | `UVLevel.symbolName` (**0.2.1**): an SF Symbol per level. `UVLevel.color` is a colour name, because the package doesn't import SwiftUI. |
 | `subsolarPoint(date:) -> SubsolarPoint`, `daylightHours(latitude:date:)` | `SubsolarPoint` has `.latitude`/`.longitude` (Lunker's tuple has the same member names). |
 
 ### `MoonCalculator` (Meeus, simplified)
@@ -64,9 +65,11 @@ math**, so it diverges from 0.2 until it is ported (see "Equinox").
 | `lunarPosition(at:…) -> LunarPosition` | Ecliptic longitude, RA/Dec, altitude/azimuth and zodiac sign. |
 | `moonPosition(at:…) -> MoonPosition` | From Otta. Elevation and azimuth in the same shape as `SunPosition`. |
 | `lunarDistance(for:) -> LunarDistanceInfo` | Distance in km, perigee/apogee status, next perigee and apogee, supermoon flag. |
+| `averageDistance`, `perigeeDistance`, `apogeeDistance` | **0.2.1.** The public reference distances (384 400 / 356 500 / 406 700 km) behind `percentOfAverage` and the status bands. Use them for gauges. |
 | `upcomingEclipses(after:limit:)` | Built-in table covering 2025–2035. Returns eclipses strictly after the given instant. |
 | `upcomingEclipses(after:limit:calendar:)` | From Lunker. Keeps an eclipse listed for its whole calendar day. |
 | `eclipseTableCoverageEnd` | From Lunker. Lets tests catch a table that has run out. |
+| `eclipsePath(for:)`, `eclipsePath(onUTCDayOf:)`, `EclipsePath`, `eclipsePathCoverage` | **0.2.1.** From Equinox. The central line of total, annular and hybrid solar eclipses, sampled about every 8 minutes from NASA GSFC path tables. Covers 2026-08-12 to 2030-11-25 only, so the central eclipses from 2031 to 2035 in the eclipse table have no path yet. |
 | `EclipseEvent` | `Identifiable`, with the stable id `type@date`. Enums: `MoonPhase`, `ZodiacConstellation`, `LunarDistanceStatus`, `EclipseType` (includes `.solarHybrid`). |
 
 ### `Solunar` (Knight's solunar periods, astronomy only)

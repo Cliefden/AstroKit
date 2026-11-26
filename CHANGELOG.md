@@ -4,6 +4,31 @@ AstroKit follows semantic versioning; while it is 0.x, a minor release may
 change numbers. Apps pin `upToNextMinor`, so they opt in to each minor release
 explicitly.
 
+## 0.2.1 — 2026-11-26
+
+Additive only: no number changes. Moves code Equinox kept in its app, widget
+and watch targets into the package.
+
+### Added
+
+- `SolarCalculator.upcomingSunEvents(after:until:latitude:longitude:timeZone:days:)`,
+  `nextSunEvent(after:…)` and `SunEvent`: sunrises and sunsets strictly after
+  an instant, in time order. The window starts the local day before, so a
+  sunset after local midnight at high latitude is found. These replace three
+  Equinox copies (Watch, widget, sunset-quality forecaster).
+- `MoonCalculator.averageDistance`, `perigeeDistance`, `apogeeDistance` are now
+  public (the values are unchanged), so gauges line up with
+  `percentOfAverage` and the distance statuses.
+- `SolarCalculator.UVLevel.symbolName`.
+- `MoonCalculator.EclipsePath`, `eclipsePath(for:)`, `eclipsePath(onUTCDayOf:)`
+  and `eclipsePathCoverage`: central-line paths for the seven total and
+  annular eclipses from 2026-08-12 to 2030-11-25 (NASA GSFC, public domain).
+  These were previously Equinox's `EclipsePaths.json`; they are now Swift data,
+  so the package still has no resources. `type` reuses `EclipseType`, so hybrid
+  eclipses are covered. Paths for the 2031–2035 central eclipses in the eclipse
+  table still need to be added.
+- Tests: `Additions021Tests.swift`.
+
 ## 0.2.0 — 2026-11-26
 
 Adopts **Lunker's** math wherever the three original implementations
